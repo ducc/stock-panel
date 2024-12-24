@@ -1,4 +1,4 @@
-use core::panic;
+use anyhow::anyhow;
 use embedded_graphics::mono_font::iso_8859_10::FONT_10X20;
 use embedded_graphics::{
     mono_font::MonoTextStyleBuilder,
@@ -41,23 +41,43 @@ fn main() {
     ];
 
     let mut handles = vec![];
+    let (err_tx, err_rx) = mpsc::channel();
 
     for panel in panels {
-        handles.push(std::thread::spawn(|| {
-            buttons(panel.product_id, panel.consume_pin, panel.add_pin)
+        handles.push(std::thread::spawn({
+            let err_tx = err_tx.clone();
+            move || {
+                if let Err(e) = buttons(panel.product_id, panel.consume_pin, panel.add_pin) {
+                    err_tx.send(e)
+                } else {
+                    Ok(())
+                }
+            }
         }));
-        handles.push(std::thread::spawn(|| {
-            screen(panel.device, panel.product_id)
+
+        handles.push(std::thread::spawn({
+            let err_tx = err_tx.clone();
+            move || {
+                if let Err(e) = screen(panel.device, panel.product_id) {
+                    err_tx.send(e)
+                } else {
+                    Ok(())
+                }
+            }
         }));
+    }
+
+    if let Some(e) = err_rx.iter().next() {
+        panic!("{:?}", e);
     }
 
     for handle in handles {
-        handle.join().unwrap();
+        handle.join().unwrap().unwrap();
     }
 }
 
-fn buttons(product_id: i32, consume_pin: u8, add_pin: u8) {
-    let gpio = Gpio::new().unwrap();
+fn buttons(product_id: i32, consume_pin: u8, add_pin: u8) -> anyhow::Result<()> {
+    let gpio = Gpio::new()?;
 
     // Create a channel to receive interrupt events
     let (tx, rx) = mpsc::channel();
@@ -70,23 +90,24 @@ fn buttons(product_id: i32, consume_pin: u8, add_pin: u8) {
 
         let tx = tx.clone();
 
-        let mut pin = gpio.get(pin_no).unwrap().into_input();
+        let mut pin = gpio.get(pin_no)?.into_input();
 
         pin.set_async_interrupt(
             Trigger::Both,
             Some(Duration::from_millis(20)),
             move |event| {
-                tx.send(PinEvent { pin: pin_no, event }).unwrap();
+                if let Err(e) = tx.send(PinEvent { pin: pin_no, event }) {
+                    println!("unable to send pin event from {pin_no}: {e:?}");
+                };
             },
-        )
-        .unwrap();
+        )?;
 
         pins.push(pin);
 
         println!("Listening for GPIO changes on pin {pin_no}...");
     }
 
-    let client = http_client();
+    let client = http_client()?;
 
     for msg in rx {
         let PinEvent { pin, event } = msg;
@@ -96,9 +117,9 @@ fn buttons(product_id: i32, consume_pin: u8, add_pin: u8) {
                 println!("{pin} pressed");
 
                 if pin == consume_pin {
-                    consume_product(&client, product_id);
+                    consume_product(&client, product_id)?;
                 } else if pin == add_pin {
-                    add_product(&client, product_id);
+                    add_product(&client, product_id)?;
                 } else {
                     println!("unknown pin {pin}");
                 }
@@ -110,27 +131,30 @@ fn buttons(product_id: i32, consume_pin: u8, add_pin: u8) {
     }
 
     println!("Exiting...");
+    Ok(())
 }
 
-fn screen(path: &str, product_id: i32) {
-    let i2c = I2cdev::new(path).unwrap();
+fn screen(path: &str, product_id: i32) -> anyhow::Result<()> {
+    let i2c = I2cdev::new(path)?;
 
     let interface = I2CDisplayInterface::new(i2c);
     let mut disp = Ssd1306::new(interface, DisplaySize128x64, DisplayRotation::Rotate0)
         .into_buffered_graphics_mode();
-    disp.init().unwrap();
+
+    disp.init()
+        .map_err(|e| anyhow!("unable to flush: {:?}", e))?;
 
     let text_style = MonoTextStyleBuilder::new()
         .font(&FONT_10X20)
         .text_color(BinaryColor::On)
         .build();
 
-    let client = http_client();
+    let client = http_client()?;
 
     loop {
         disp.clear();
 
-        let product = get_product(&client, product_id);
+        let product = get_product(&client, product_id)?;
 
         Text::with_baseline(
             &product.product.name,
@@ -139,7 +163,7 @@ fn screen(path: &str, product_id: i32) {
             Baseline::Top,
         )
         .draw(&mut disp)
-        .unwrap();
+        .map_err(|e| anyhow!("unable to flush: {:?}", e))?;
 
         Text::with_baseline(
             &format!("{}", &product.stock_amount),
@@ -148,41 +172,39 @@ fn screen(path: &str, product_id: i32) {
             Baseline::Top,
         )
         .draw(&mut disp)
-        .unwrap();
+        .map_err(|e| anyhow!("unable to flush: {:?}", e))?;
 
-        disp.flush().unwrap();
+        disp.flush()
+            .map_err(|e| anyhow!("unable to flush: {:?}", e))?;
 
         std::thread::sleep(Duration::from_millis(500));
     }
 }
 
-pub fn http_client() -> reqwest::blocking::Client {
+pub fn http_client() -> anyhow::Result<reqwest::blocking::Client> {
     let mut headers = HeaderMap::new();
     headers.insert(
         "GROCY-API-KEY",
         /* good luck */
-        HeaderValue::from_str("G9owQF7bLWDKctBYB6WTZ0xrndSMTLumHJ3k8WtitNozAL9C81").unwrap(),
+        HeaderValue::from_str("G9owQF7bLWDKctBYB6WTZ0xrndSMTLumHJ3k8WtitNozAL9C81")?,
     );
-    headers.insert("accept", HeaderValue::from_str("application/json").unwrap());
+    headers.insert("accept", HeaderValue::from_str("application/json")?);
 
-    reqwest::blocking::Client::builder()
+    Ok(reqwest::blocking::Client::builder()
         .default_headers(headers)
-        .build()
-        .unwrap()
+        .build()?)
 }
 
-pub fn get_product(client: &reqwest::blocking::Client, id: i32) -> Product {
+pub fn get_product(client: &reqwest::blocking::Client, id: i32) -> anyhow::Result<Product> {
     let req = reqwest::blocking::Request::new(
         Method::GET,
-        format!("http://100.117.133.36:9283/api/stock/products/{}", id)
-            .parse()
-            .unwrap(),
+        format!("http://100.117.133.36:9283/api/stock/products/{}", id).parse()?,
     );
-    let res: Product = client.execute(req).unwrap().json().unwrap();
-    res
+    let res: Product = client.execute(req)?.json()?;
+    Ok(res)
 }
 
-fn consume_product(client: &reqwest::blocking::Client, id: i32) {
+fn consume_product(client: &reqwest::blocking::Client, id: i32) -> anyhow::Result<()> {
     let res = client
         .post(format!(
             "http://100.117.133.36:9283/api/stock/products/{}/consume",
@@ -193,15 +215,16 @@ fn consume_product(client: &reqwest::blocking::Client, id: i32) {
             "transaction_type": "consume",
             "spoiled": false,
         }))
-        .send()
-        .unwrap();
+        .send()?;
 
     if !res.status().is_success() {
-        panic!("req failed");
+        return Err(anyhow!("bad status: {}", res.status()));
     }
+
+    Ok(())
 }
 
-fn add_product(client: &reqwest::blocking::Client, id: i32) {
+fn add_product(client: &reqwest::blocking::Client, id: i32) -> anyhow::Result<()> {
     let res = client
         .post(format!(
             "http://100.117.133.36:9283/api/stock/products/{}/add",
@@ -213,12 +236,13 @@ fn add_product(client: &reqwest::blocking::Client, id: i32) {
             "best_before_date": None::<String>,
             "price": None::<String>,
         }))
-        .send()
-        .unwrap();
+        .send()?;
 
     if !res.status().is_success() {
-        panic!("req failed");
+        return Err(anyhow!("bad status: {}", res.status()));
     }
+
+    Ok(())
 }
 
 struct PinEvent {
