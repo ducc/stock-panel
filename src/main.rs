@@ -342,7 +342,7 @@ pub fn http_client() -> anyhow::Result<reqwest::blocking::Client> {
     let mut headers = HeaderMap::new();
     headers.insert(
         "GROCY-API-KEY",
-        /* good luck */
+        /* good luck! */
         HeaderValue::from_str("G9owQF7bLWDKctBYB6WTZ0xrndSMTLumHJ3k8WtitNozAL9C81")?,
     );
     headers.insert("accept", HeaderValue::from_str("application/json")?);
